@@ -7,6 +7,12 @@ import (
 )
 
 func (c *Client) ListConversations(ctx context.Context, count int, folder gmproto.ListConversationsRequest_Folder) (*gmproto.ListConversationsResponse, error) {
+	return c.ListConversationsWithCursor(ctx, count, folder, nil)
+}
+
+// ListConversationsWithCursor returns a page of conversations. Pass the cursor
+// from the previous response to continue listing older conversations.
+func (c *Client) ListConversationsWithCursor(ctx context.Context, count int, folder gmproto.ListConversationsRequest_Folder, cursor *gmproto.Cursor) (*gmproto.ListConversationsResponse, error) {
 	msgType := gmproto.MessageType_BUGLE_MESSAGE
 	if !c.conversationsFetchedOnce {
 		msgType = gmproto.MessageType_BUGLE_ANNOTATION
@@ -14,7 +20,7 @@ func (c *Client) ListConversations(ctx context.Context, count int, folder gmprot
 	}
 	return typedResponse[*gmproto.ListConversationsResponse](c.sessionHandler.sendMessageWithParams(ctx, SendMessageParams{
 		Action:      gmproto.ActionType_LIST_CONVERSATIONS,
-		Data:        &gmproto.ListConversationsRequest{Count: int64(count), Folder: folder},
+		Data:        &gmproto.ListConversationsRequest{Count: int64(count), Folder: folder, Cursor: cursor},
 		MessageType: msgType,
 	}))
 }
@@ -149,6 +155,13 @@ func (c *Client) SetActiveSession(ctx context.Context) error {
 func (c *Client) IsBugleDefault(ctx context.Context) (*gmproto.IsBugleDefaultResponse, error) {
 	actionType := gmproto.ActionType_IS_BUGLE_DEFAULT
 	return typedResponse[*gmproto.IsBugleDefaultResponse](c.sessionHandler.sendMessage(ctx, actionType, nil))
+}
+
+// NotifyDittoActivity waits for the phone's liveness response. Cancellation
+// releases the response waiter, just like other synchronous phone requests.
+func (c *Client) NotifyDittoActivity(ctx context.Context) error {
+	_, err := c.sessionHandler.sendMessage(ctx, gmproto.ActionType_NOTIFY_DITTO_ACTIVITY, &gmproto.NotifyDittoActivityRequest{Success: true})
+	return err
 }
 
 func (c *Client) notifyDittoActivity(ctx context.Context) (chan *IncomingRPCMessage, string, error) {
