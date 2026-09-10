@@ -43,9 +43,21 @@ type SessionHandler struct {
 
 	ackMapLock sync.Mutex
 	ackMap     []string
-	ackTicker  *time.Ticker
+
+	ackLifecycleLock sync.Mutex
+	ackRunLock       sync.Mutex
+	ackRun           *ackInterval
 
 	sessionID string
+}
+
+type ackInterval struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	ticker   *time.Ticker
+	done     chan struct{}
+	requests sync.WaitGroup
+	stopping bool // guarded by SessionHandler.ackRunLock
 }
 
 func (s *SessionHandler) ResetSessionID() {
@@ -340,20 +352,99 @@ func (s *SessionHandler) queueMessageAck(messageID string) {
 	}
 }
 
-func (s *SessionHandler) startAckInterval() {
-	if s.ackTicker != nil {
+func (s *SessionHandler) startAckInterval(ctx context.Context) {
+	s.ackLifecycleLock.Lock()
+	defer s.ackLifecycleLock.Unlock()
+	s.ackRunLock.Lock()
+	previous := s.ackRun
+	if previous != nil && previous.ctx.Err() == nil {
+		s.ackRunLock.Unlock()
 		return
 	}
-	ticker := time.NewTicker(5 * time.Second)
-	s.ackTicker = ticker
-	go func() {
-		for range ticker.C {
-			s.sendAckRequest()
+	s.ackRunLock.Unlock()
+	if previous != nil {
+		// A canceled interval must finish its admitted requests before the next
+		// generation can drain or retry the same queue.
+		<-previous.done
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	run := &ackInterval{
+		ctx:    ctx,
+		cancel: cancel,
+		ticker: time.NewTicker(5 * time.Second),
+		done:   make(chan struct{}),
+	}
+	s.ackRunLock.Lock()
+	s.ackRun = run
+	s.ackRunLock.Unlock()
+	go s.runAckInterval(run)
+}
+
+func (s *SessionHandler) runAckInterval(run *ackInterval) {
+	defer func() {
+		run.ticker.Stop()
+		run.cancel()
+		// Admission checks the context under ackRunLock, so no request can be
+		// added once cancellation has begun, including post-connect flushes.
+		s.ackRunLock.Lock()
+		run.stopping = true
+		s.ackRunLock.Unlock()
+		run.requests.Wait()
+		s.ackRunLock.Lock()
+		if s.ackRun == run {
+			s.ackRun = nil
 		}
+		s.ackRunLock.Unlock()
+		close(run.done)
 	}()
+	for {
+		select {
+		case <-run.ctx.Done():
+			return
+		case <-run.ticker.C:
+			s.sendAckRequestForRun(run)
+		}
+	}
+}
+
+func (s *SessionHandler) stopAckInterval() {
+	s.ackLifecycleLock.Lock()
+	defer s.ackLifecycleLock.Unlock()
+	s.ackRunLock.Lock()
+	run := s.ackRun
+	if run != nil {
+		// Close admission before waiting; this also prevents delayed
+		// post-connect callbacks from starting an ack on a retired client.
+		s.ackRun = nil
+		run.stopping = true
+		run.cancel()
+	}
+	s.ackRunLock.Unlock()
+	if run != nil {
+		<-run.done
+	}
 }
 
 func (s *SessionHandler) sendAckRequest() {
+	s.ackRunLock.Lock()
+	run := s.ackRun
+	s.ackRunLock.Unlock()
+	s.sendAckRequestForRun(run)
+}
+
+func (s *SessionHandler) sendAckRequestForRun(run *ackInterval) {
+	s.ackRunLock.Lock()
+	if run == nil || s.ackRun != run || run.stopping || run.ctx.Err() != nil {
+		s.ackRunLock.Unlock()
+		return
+	}
+	run.requests.Add(1)
+	s.ackRunLock.Unlock()
+	defer run.requests.Done()
+
 	s.ackMapLock.Lock()
 	dataToAck := s.ackMap
 	s.ackMap = nil
@@ -383,15 +474,17 @@ func (s *SessionHandler) sendAckRequest() {
 		url = util.AckMessagesURLGoogle
 	}
 	_, err := typedHTTPResponse[*gmproto.OutgoingRPCResponse](
-		s.client.makeProtobufHTTPRequest(url, payload, ContentTypePBLite),
+		s.client.makeProtobufHTTPRequestContext(run.ctx, url, payload, ContentTypePBLite, false),
 	)
 	if err != nil {
 		// Unacked messages may stall event delivery, so re-queue them to retry on the next tick.
 		s.ackMapLock.Lock()
 		if len(dataToAck)+len(s.ackMap) <= maxQueuedAcks {
 			s.ackMap = append(dataToAck, s.ackMap...)
-			s.client.Logger.Err(err).Strs("message_ids", dataToAck).Msg("Failed to send acks, re-queued for retry")
-		} else {
+			if run.ctx.Err() == nil {
+				s.client.Logger.Err(err).Strs("message_ids", dataToAck).Msg("Failed to send acks, re-queued for retry")
+			}
+		} else if run.ctx.Err() == nil {
 			s.client.Logger.Err(err).Strs("message_ids", dataToAck).Msg("Failed to send acks, dropping as retry queue is full")
 		}
 		s.ackMapLock.Unlock()
