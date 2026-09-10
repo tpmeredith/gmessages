@@ -229,8 +229,8 @@ func (c *Client) startLongPolling(ctx context.Context) {
 	//	return fmt.Errorf("failed to get web encryption key: %w", err)
 	//}
 	//c.updateWebEncryptionKey(webEncryptionKeyResponse.GetKey())
+	c.sessionHandler.startAckInterval(ctx)
 	go c.doLongPoll(ctx, true, false, c.postConnect)
-	c.sessionHandler.startAckInterval()
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -256,6 +256,8 @@ func (c *Client) ConnectBackground(ctx context.Context) error {
 	if err := c.checkLoggedIn(); err != nil {
 		return err
 	}
+	c.sessionHandler.startAckInterval(ctx)
+	defer c.sessionHandler.stopAckInterval()
 	cleanExit := c.doLongPoll(ctx, true, true, nil)
 	c.sessionHandler.sendAckRequest()
 	if !cleanExit {
@@ -327,6 +329,7 @@ func (c *Client) shouldCheckBugleDefault() bool {
 }
 
 func (c *Client) Disconnect() {
+	c.sessionHandler.stopAckInterval()
 	c.closeLongPolling()
 	// Fail any requests that are still waiting for a response from the phone:
 	// the responses are delivered over the long polling connection, so they can
